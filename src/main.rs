@@ -3,6 +3,7 @@ mod commands;
 mod display;
 mod session;
 mod tree;
+mod tui;
 
 use clap::Parser;
 use cli::Cli;
@@ -19,7 +20,7 @@ fn main() {
             return;
         }
     };
-    if let Err(e) = commands::dispatch(command) {
+    if let Err(e) = commands::dispatch(command, cli.close_on_exit) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

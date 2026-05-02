@@ -36,16 +36,6 @@ pub fn clean_system_tags(text: &str) -> String {
 
 // ── Formatting helpers ───────────────────────────────────────────────
 
-pub fn shorten(text: &str, n: usize) -> String {
-    let text: String = text.replace('\n', " ").replace('\r', "");
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= n {
-        text
-    } else {
-        format!("{}...", chars.into_iter().take(n).collect::<String>())
-    }
-}
-
 pub fn shorten_mid(text: &str, n: usize) -> String {
     let text: String = text.replace('\n', " ").replace('\r', "");
     let chars: Vec<char> = text.chars().collect();
@@ -470,29 +460,4 @@ fn leaf_node<'a>(all_nodes: &'a [TreeNode], node: &'a TreeNode) -> &'a TreeNode 
         let last = node.children[node.children.len() - 1];
         leaf_node(all_nodes, &all_nodes[last])
     }
-}
-
-// ── Legacy helpers for ls/cd/pwd ─────────────────────────────────────
-
-pub fn node_tag(node: &TreeNode) -> &str {
-    if node.role == "user" { "user" } else { "Claude" }
-}
-
-pub fn node_model_suffix(node: &TreeNode) -> String {
-    if node.role == "assistant" && !node.model.is_empty() {
-        format!(" [{}]", node.model.rsplit('/').next().unwrap_or(&node.model))
-    } else {
-        String::new()
-    }
-}
-
-pub fn child_line(idx: usize, node: &TreeNode) -> String {
-    let flag = if node.has_tools { " ⚡" } else { "" };
-    let ts = if node.timestamp.is_empty() {
-        String::new()
-    } else {
-        fmt_time(&node.timestamp)
-    };
-    let preview = node.preview.chars().take(80).collect::<String>();
-    format!(" {}│ {}{} {} {}{}", idx, node_tag(node), node_model_suffix(node), ts, preview, flag)
 }

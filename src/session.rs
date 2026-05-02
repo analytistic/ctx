@@ -1,9 +1,8 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 
 fn home_dir() -> PathBuf {
@@ -22,6 +21,22 @@ fn projects_dir() -> PathBuf {
     home_dir().join(".claude/projects")
 }
 
+/// Infer the JSONL path from session metadata when the file doesn't exist yet.
+/// Handles the race where `!ctx` runs before Claude Code has flushed the
+/// first events to disk (JSONL created lazily on first persist).
+fn infer_jsonl_path(sid: &str, info: &Value) -> PathBuf {
+    // Transform cwd into the project directory name used by Claude Code:
+    //   /Users/alex/projects/ctx  →  -Users-alex-projects-ctx
+    if let Some(cwd) = info.get("cwd").and_then(|v| v.as_str()) {
+        let proj_name = format!("-{}", cwd.trim_start_matches('/').replace('/', "-"));
+        let proj_dir = projects_dir().join(&proj_name);
+        if proj_dir.exists() {
+            return proj_dir.join(format!("{sid}.jsonl"));
+        }
+    }
+    sessions_dir().join(format!("{sid}.jsonl"))
+}
+
 /// Walk up the process tree to find the Claude Code session.
 /// `ctx` is typically spawned as: claude -> zsh -> ctx
 /// We check each ancestor PID against `~/.claude/sessions/{pid}.json`.
@@ -35,9 +50,13 @@ fn find_by_pid_chain() -> Option<(PathBuf, Value)> {
         if let Ok(content) = fs::read_to_string(&sess_file) {
             if let Ok(info) = serde_json::from_str::<Value>(&content) {
                 let sid = info.get("sessionId")?.as_str()?;
-                if let Some(jsonl) = find_jsonl(sid) {
-                    return Some((jsonl, info));
-                }
+                let jsonl = find_jsonl(sid).unwrap_or_else(|| {
+                    // JSONL may not exist yet (Claude Code creates it lazily
+                    // on first event persist). Construct the expected path
+                    // from cwd + sessionId instead of giving up.
+                    infer_jsonl_path(sid, &info)
+                });
+                return Some((jsonl, info));
             }
         }
 
@@ -117,9 +136,92 @@ fn find_by_time() -> Option<(PathBuf, Value)> {
     None
 }
 
-/// Find the current session: try PID chain first, then time fallback.
+/// Find the current session: try PID chain first, then alive-PID scan, then time fallback.
 pub fn find_session() -> Option<(PathBuf, Value)> {
-    find_by_pid_chain().or_else(find_by_time)
+    find_by_pid_chain()
+        .or_else(|| find_by_alive_pid())
+        .or_else(find_by_time)
+}
+
+/// Find a session by explicit session ID.
+pub fn find_session_by_id(sid: &str) -> Option<(PathBuf, Value)> {
+    let jsonl = find_jsonl(sid)?;
+    // Load the matching session metadata
+    let sdir = sessions_dir();
+    if let Ok(entries) = fs::read_dir(&sdir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(info) = serde_json::from_str::<Value>(&content) {
+                    if info.get("sessionId").and_then(|v| v.as_str()) == Some(sid) {
+                        return Some((jsonl, info));
+                    }
+                }
+            }
+        }
+    }
+    // JSONL found but no metadata — still return the path
+    Some((jsonl, Value::Null))
+}
+
+/// Scan all session files for alive `claude` processes.
+/// Returns the most recently modified session file whose PID is alive
+/// and running as `claude`.
+fn find_by_alive_pid() -> Option<(PathBuf, Value)> {
+    let sdir = sessions_dir();
+    let mut candidates: Vec<(PathBuf, Value, std::time::SystemTime)> = Vec::new();
+
+    let entries = fs::read_dir(&sdir).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let info: Value = fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+        let pid = info.get("pid").and_then(|v| v.as_i64())? as u32;
+
+        if !pid_is_alive_claude(pid) {
+            continue;
+        }
+
+        let mtime = path.metadata().ok()?.modified().ok()?;
+        candidates.push((path, info, mtime));
+    }
+
+    // Most recently modified first
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+    let (_path, info, _mtime) = candidates.into_iter().next()?;
+
+    let sid = info.get("sessionId")?.as_str()?;
+    let jsonl = find_jsonl(sid).unwrap_or_else(|| infer_jsonl_path(sid, &info));
+    Some((jsonl, info))
+}
+
+/// Check if a PID is alive and running the `claude` binary.
+fn pid_is_alive_claude(pid: u32) -> bool {
+    let alive = process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !alive {
+        return false;
+    }
+
+    let output = match process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+    {
+        Some(o) => o,
+        None => return false,
+    };
+    let cmdline = String::from_utf8_lossy(&output.stdout);
+    cmdline.contains("claude")
 }
 
 // ── Event I/O ────────────────────────────────────────────────────────
@@ -133,28 +235,6 @@ pub fn load_events(path: &Path) -> Result<Vec<Value>> {
         .collect())
 }
 
-pub fn save_events(path: &Path, events: &[Value]) -> Result<()> {
-    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut file = fs::File::create(&tmp_path)
-        .with_context(|| format!("Failed to create temp file {:?}", tmp_path))?;
-    for ev in events {
-        writeln!(file, "{}", serde_json::to_string(ev)?)?;
-    }
-    file.flush()?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename {:?} to {:?}", tmp_path, path))?;
-    Ok(())
-}
-
-pub fn append_event(path: &Path, event: &Value) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(event)?)?;
-    file.flush()?;
-    Ok(())
-}
 
 // ── PID checking ─────────────────────────────────────────────────────
 
@@ -169,46 +249,4 @@ pub fn session_pid_alive(info: &Value) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-// ── CWD state (deprecated, kept for legacy ls/cd/pwd) ────────────────
-
-fn cwd_state_path() -> PathBuf {
-    home_dir().join(".claude/ctx-cwd.json")
-}
-
-pub fn load_cwd(session_id: &str) -> Vec<usize> {
-    let content = match fs::read_to_string(cwd_state_path()) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let data: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    if data.get("session_id").and_then(|v| v.as_str()) != Some(session_id) {
-        return Vec::new();
-    }
-    data.get("cwd")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
-        .unwrap_or_default()
-}
-
-pub fn save_cwd(session_id: &str, cwd: &[usize]) {
-    if let Ok(content) = serde_json::to_string(&serde_json::json!({
-        "session_id": session_id,
-        "cwd": cwd,
-    })) {
-        let _ = fs::write(cwd_state_path(), &content);
-    }
-}
-
-pub fn guard_session(info: &Value) -> Result<()> {
-    if let Some(pid) = info.get("pid").and_then(|v| v.as_i64()) {
-        if session_pid_alive(info) {
-            anyhow::bail!("✗ Claude is still running (PID {pid}). Stop it first, then retry.");
-        }
-    }
-    Ok(())
 }

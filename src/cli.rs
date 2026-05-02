@@ -5,18 +5,14 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Close Terminal window on TUI exit (internal, used by osascript launch)
+    #[arg(long, hide = true, global = true)]
+    pub close_on_exit: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List contents of current node
-    Ls,
-    /// Change current node (e.g. cd 2, cd 2/1, cd .., cd /)
-    Cd {
-        path: Vec<String>,
-    },
-    /// Show current path
-    Pwd,
     /// Show conversation tree centered on current position
     List {
         /// Max depth per root (default: 2)
@@ -35,19 +31,10 @@ pub enum Command {
     Info,
     /// Follow live session (like tail -f)
     Tail,
-    /// Insert a context note (Claude must be stopped)
-    Insert {
-        #[arg(long)]
-        under: Option<String>,
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-    },
-    /// Remove message + all descendants (Claude must be stopped)
-    Rm {
-        uuid: String,
-    },
-    /// Export session as JSON
-    Export {
-        file: Option<String>,
+    /// Interactive session tree browser
+    Tui {
+        /// Session ID to load (internal, used by osascript launch)
+        #[arg(long, hide = true)]
+        session: Option<String>,
     },
 }
